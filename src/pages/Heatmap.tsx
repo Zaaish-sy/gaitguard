@@ -4,7 +4,6 @@ import { Flame, Info, ZoomIn, ZoomOut, RotateCcw, RefreshCw, ChevronDown } from 
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Slider } from '@/components/ui/slider';
 import { supabase } from '@/lib/supabase';
 import type { Worker, CeiRecord } from '@/types';
 
@@ -14,9 +13,10 @@ interface JointNode {
   x: number;
   y: number;
   stress: number;
+  rawAngle: number | null; // sudut rata-rata aktual (derajat), null jika tidak ada data
 }
 
-const BASE_NODES: Omit<JointNode, 'stress'>[] = [
+const BASE_NODES: Omit<JointNode, 'stress' | 'rawAngle'>[] = [
   { id: 'neck',       name: 'Neck',        x: 200, y: 40  },
   { id: 'l-shoulder', name: 'L Shoulder',  x: 160, y: 70  },
   { id: 'r-shoulder', name: 'R Shoulder',  x: 240, y: 70  },
@@ -68,13 +68,24 @@ function getStressLabel(s: number) {
   return 'Minimal';
 }
 
+// Rekomendasi tindakan berdasarkan level stress — tujuan heatmap ini
+// adalah membantu menentukan joint mana yang butuh intervensi ergonomi.
+function getStressAdvice(s: number) {
+  if (s >= 80) return 'Risiko cedera tinggi. Perlu evaluasi postur kerja & istirahat segera.';
+  if (s >= 60) return 'Beban berulang signifikan. Pertimbangkan rotasi tugas atau penyesuaian workstation.';
+  if (s >= 40) return 'Masih dalam batas wajar, tapi perlu dipantau jika berlangsung lama.';
+  if (s >= 20) return 'Beban ringan, postur relatif aman.';
+  return 'Tidak ada beban signifikan terdeteksi pada joint ini.';
+}
+
 export default function Heatmap() {
   const [workers,       setWorkers]       = useState<Worker[]>([]);
   const [workerId,      setWorkerId]      = useState('all');
-  const [jointNodes,    setJointNodes]    = useState<JointNode[]>(BASE_NODES.map(n => ({ ...n, stress: 0 })));
+  const [jointNodes,    setJointNodes]    = useState<JointNode[]>(BASE_NODES.map(n => ({ ...n, stress: 0, rawAngle: null })));
   const [selectedJoint, setSelectedJoint] = useState<JointNode | null>(null);
   const [zoom,          setZoom]          = useState(1);
-  const [modulator,     setModulator]     = useState([100]);
+  const [recordCount,   setRecordCount]   = useState(0);
+  const [dateRange,     setDateRange]     = useState<{ from: string; to: string } | null>(null);
   const [loading,       setLoading]       = useState(true);
   const [syncing,       setSyncing]       = useState(false);
 
@@ -90,52 +101,62 @@ export default function Heatmap() {
     setSyncing(true);
     let q = supabase
       .from('cei_records')
-      .select('joint_angles, reba_score')
-      .not('joint_angles', 'is', null);
+      .select('joint_angles, reba_score, shift_date')
+      .not('joint_angles', 'is', null)
+      .order('shift_date', { ascending: true });
     if (workerId !== 'all') q = q.eq('worker_id', workerId);
     const { data } = await q;
 
     if (!data || data.length === 0) {
-      setJointNodes(BASE_NODES.map(n => ({ ...n, stress: 0 })));
+      setJointNodes(BASE_NODES.map(n => ({ ...n, stress: 0, rawAngle: null })));
+      setRecordCount(0);
+      setDateRange(null);
       setLoading(false);
       setSyncing(false);
       return;
     }
 
-    // Rata-rata angle per joint key
+    // Rata-rata angle per joint key — hanya dari data real RPi4/MediaPipe
     const sums: Record<string, number> = {};
     const counts: Record<string, number> = {};
-    type HeatmapRow = { joint_angles: Record<string, number> | null; reba_score: number }
+    type HeatmapRow = { joint_angles: Record<string, number> | null; reba_score: number; shift_date: string }
     data.forEach((row: HeatmapRow) => {
       if (!row.joint_angles) return;
       Object.entries(row.joint_angles).forEach(([k, v]) => {
-        sums[k]   = (sums[k]   || 0) + (v as number);
+        if (typeof v !== 'number') return;
+        sums[k]   = (sums[k]   || 0) + v;
         counts[k] = (counts[k] || 0) + 1;
       });
     });
 
-    // Map ke stress per node
+    // Map rata-rata sudut & stress ke setiap node anatomi.
+    // Hanya joint yang benar-benar terukur oleh MediaPipe (neck, shoulder, elbow, trunk, hip, knee)
+    // yang diberi nilai. Wrist & ankle tidak diukur RPi4 → dibiarkan null (tidak ditampilkan sebagai heat).
     const stressMap: Record<string, number> = {};
+    const angleMap:  Record<string, number> = {};
     Object.entries(JOINT_MAP).forEach(([joint, nodeIds]) => {
-      const avg = counts[joint] ? sums[joint] / counts[joint] : 0;
+      if (!counts[joint]) return; // tidak ada data untuk joint ini, skip
+      const avg = sums[joint] / counts[joint];
       const stress = angleToStress(joint, avg);
-      nodeIds.forEach(id => { stressMap[id] = stress; });
+      nodeIds.forEach(id => {
+        stressMap[id] = stress;
+        angleMap[id]  = avg;
+      });
     });
 
-    // Wrist tidak ada di joint_angles → set 20% default
-    ['l-wrist', 'r-wrist', 'l-ankle', 'r-ankle'].forEach(id => {
-      if (!(id in stressMap)) stressMap[id] = 15;
-    });
-
-    setJointNodes(BASE_NODES.map(n => ({ ...n, stress: stressMap[n.id] ?? 0 })));
+    setJointNodes(BASE_NODES.map(n => ({
+      ...n,
+      stress:   stressMap[n.id] ?? 0,
+      rawAngle: angleMap[n.id] ?? null,
+    })));
+    setRecordCount(data.length);
+    setDateRange({ from: data[0].shift_date, to: data[data.length - 1].shift_date });
     setLoading(false);
     setSyncing(false);
   }
 
-  const adjustedNodes = jointNodes.map(j => ({
-    ...j,
-    stress: Math.min(100, Math.round((j.stress * modulator[0]) / 100)),
-  }));
+  const measuredNodes   = jointNodes.filter(j => j.rawAngle !== null);
+  const unmeasuredNodes = jointNodes.filter(j => j.rawAngle === null);
 
   return (
     <motion.div
@@ -149,7 +170,8 @@ export default function Heatmap() {
         <div>
           <h1 className="text-xl font-bold text-slate-800">Stress Heatmap</h1>
           <p className="text-sm text-slate-500 mt-0.5">
-            Body joint stress dari data ergonomi real · {loading ? '...' : `${adjustedNodes.length} joints`}
+            Rata-rata sudut tubuh dari {loading ? '...' : recordCount} record CEI
+            {dateRange ? ` · ${dateRange.from} s/d ${dateRange.to}` : ''}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -174,7 +196,7 @@ export default function Heatmap() {
           <Button variant="outline" size="icon" onClick={() => setZoom(z => Math.max(z - 0.1, 0.5))}>
             <ZoomOut className="w-4 h-4" />
           </Button>
-          <Button variant="outline" size="icon" onClick={() => { setZoom(1); setModulator([100]); }}>
+          <Button variant="outline" size="icon" onClick={() => setZoom(1)}>
             <RotateCcw className="w-4 h-4" />
           </Button>
         </div>
@@ -231,8 +253,20 @@ export default function Heatmap() {
                   <rect x="160" y="215" width="35" height="80" rx="10" fill="url(#bodyGrad)" stroke="#E2E8F0" strokeWidth="1.5" />
                   <rect x="205" y="215" width="35" height="80" rx="10" fill="url(#bodyGrad)" stroke="#E2E8F0" strokeWidth="1.5" />
 
+                  {/* Unmeasured joints (wrist/ankle — tidak diukur RPi4) */}
+                  {unmeasuredNodes.map(joint => (
+                    <circle
+                      key={`unmeasured-${joint.id}`}
+                      cx={joint.x} cy={joint.y}
+                      r={4}
+                      fill="#CBD5E1"
+                      stroke="white" strokeWidth="1.5"
+                      opacity={0.6}
+                    />
+                  ))}
+
                   {/* Heat zones */}
-                  {adjustedNodes.map(joint => (
+                  {measuredNodes.map(joint => (
                     <circle
                       key={joint.id}
                       cx={joint.x} cy={joint.y}
@@ -244,7 +278,7 @@ export default function Heatmap() {
                   ))}
 
                   {/* Joint nodes */}
-                  {adjustedNodes.map(joint => (
+                  {measuredNodes.map(joint => (
                     <g key={joint.id} className="cursor-pointer" onClick={() => setSelectedJoint(joint)}>
                       <circle
                         cx={joint.x} cy={joint.y}
@@ -266,7 +300,7 @@ export default function Heatmap() {
                   ))}
 
                   {/* Labels */}
-                  {adjustedNodes.filter(j => j.stress >= 60).map(joint => (
+                  {measuredNodes.filter(j => j.stress >= 60).map(joint => (
                     <text key={`label-${joint.id}`}
                       x={joint.x + 12} y={joint.y - 8}
                       fontSize="9" fill={getStressColor(joint.stress)} fontWeight="600"
@@ -282,24 +316,29 @@ export default function Heatmap() {
 
         {/* Right Panel */}
         <div className="space-y-4">
-          {/* Stress Modulator */}
+          {/* Data Source Info */}
           <Card className="border-blue-100/60 shadow-sm bg-white/80 backdrop-blur-sm">
             <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-semibold">Stress Modulator</CardTitle>
-              <p className="text-xs text-slate-400">Simulate stress levels</p>
+              <CardTitle className="text-sm font-semibold">Tentang Heatmap Ini</CardTitle>
+              <p className="text-xs text-slate-400">Data real dari RPi4 + MediaPipe</p>
             </CardHeader>
-            <CardContent className="space-y-4">
-              <div>
-                <div className="flex justify-between mb-2">
-                  <span className="text-xs text-slate-500">Intensity</span>
-                  <span className="text-xs font-mono font-semibold text-blue-600">{modulator[0]}%</span>
+            <CardContent className="space-y-3">
+              <div className="grid grid-cols-2 gap-2 text-center">
+                <div className="p-2 rounded-lg bg-slate-50">
+                  <p className="text-lg font-bold text-slate-700">{recordCount}</p>
+                  <p className="text-[10px] text-slate-400">Total Records</p>
                 </div>
-                <Slider value={modulator} onValueChange={setModulator} min={50} max={150} step={5} />
+                <div className="p-2 rounded-lg bg-slate-50">
+                  <p className="text-lg font-bold text-slate-700">{measuredNodes.length}</p>
+                  <p className="text-[10px] text-slate-400">Joint Terukur</p>
+                </div>
               </div>
               <div className="flex items-start gap-2 p-2.5 rounded-lg bg-blue-50 border border-blue-100">
                 <Info className="w-4 h-4 text-blue-500 flex-shrink-0 mt-0.5" />
                 <p className="text-[11px] text-blue-600 leading-relaxed">
-                  Data stress dihitung dari rata-rata joint angles di database. Modulator untuk simulasi skenario.
+                  Warna menunjukkan rata-rata sudut tekuk joint dibanding batas ergonomis aman (REBA).
+                  Semakin merah, semakin sering joint tersebut berada di sudut berisiko.
+                  Titik abu-abu (wrist/ankle) belum diukur oleh model pose saat ini.
                 </p>
               </div>
             </CardContent>
@@ -333,8 +372,10 @@ export default function Heatmap() {
                 </div>
                 <div className="grid grid-cols-2 gap-2 text-center">
                   <div className="p-2 rounded-lg bg-slate-50">
-                    <p className="text-lg font-bold text-slate-700">{selectedJoint.stress}%</p>
-                    <p className="text-[10px] text-slate-400">Stress Index</p>
+                    <p className="text-lg font-bold text-slate-700">
+                      {selectedJoint.rawAngle !== null ? `${selectedJoint.rawAngle.toFixed(1)}°` : '—'}
+                    </p>
+                    <p className="text-[10px] text-slate-400">Avg Angle</p>
                   </div>
                   <div className="p-2 rounded-lg bg-slate-50">
                     <p className="text-lg font-bold" style={{ color: getStressColor(selectedJoint.stress) }}>
@@ -342,6 +383,12 @@ export default function Heatmap() {
                     </p>
                     <p className="text-[10px] text-slate-400">Category</p>
                   </div>
+                </div>
+                <div className="flex items-start gap-2 p-2.5 rounded-lg bg-slate-50 border border-slate-100">
+                  <Info className="w-4 h-4 text-slate-400 flex-shrink-0 mt-0.5" />
+                  <p className="text-[11px] text-slate-500 leading-relaxed">
+                    {getStressAdvice(selectedJoint.stress)}
+                  </p>
                 </div>
               </CardContent>
             </Card>
@@ -362,16 +409,25 @@ export default function Heatmap() {
             </CardHeader>
             <CardContent className="space-y-2">
               {[
-                { label: 'Critical Zones', count: adjustedNodes.filter(j => j.stress >= 80).length, color: 'text-red-500' },
-                { label: 'High Stress',    count: adjustedNodes.filter(j => j.stress >= 60 && j.stress < 80).length, color: 'text-orange-500' },
-                { label: 'Moderate',       count: adjustedNodes.filter(j => j.stress >= 40 && j.stress < 60).length, color: 'text-amber-500' },
-                { label: 'Low/Minimal',    count: adjustedNodes.filter(j => j.stress < 40).length, color: 'text-emerald-500' },
+                { label: 'Critical Zones', count: measuredNodes.filter(j => j.stress >= 80).length, color: 'text-red-500' },
+                { label: 'High Stress',    count: measuredNodes.filter(j => j.stress >= 60 && j.stress < 80).length, color: 'text-orange-500' },
+                { label: 'Moderate',       count: measuredNodes.filter(j => j.stress >= 40 && j.stress < 60).length, color: 'text-amber-500' },
+                { label: 'Low/Minimal',    count: measuredNodes.filter(j => j.stress < 40).length, color: 'text-emerald-500' },
               ].map(item => (
                 <div key={item.label} className="flex items-center justify-between py-1">
                   <span className="text-xs text-slate-500">{item.label}</span>
                   <span className={`text-sm font-bold ${item.color}`}>{item.count}</span>
                 </div>
               ))}
+              {measuredNodes.filter(j => j.stress >= 60).length > 0 && (
+                <div className="flex items-start gap-2 p-2.5 mt-2 rounded-lg bg-orange-50 border border-orange-100">
+                  <Info className="w-4 h-4 text-orange-500 flex-shrink-0 mt-0.5" />
+                  <p className="text-[11px] text-orange-600 leading-relaxed">
+                    {measuredNodes.filter(j => j.stress >= 60).length} joint berada di level High/Critical —
+                    perlu perhatian khusus untuk pencegahan cedera muskuloskeletal.
+                  </p>
+                </div>
+              )}
             </CardContent>
           </Card>
         </div>

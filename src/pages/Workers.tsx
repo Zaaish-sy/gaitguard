@@ -4,6 +4,7 @@ import {
   Users, Search, Plus, Pencil, Trash2,
   ShieldCheck, AlertTriangle, Filter,
   User, Calendar, Building2,
+  Activity, TrendingUp, Clock, X,
 } from 'lucide-react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -55,6 +56,7 @@ export default function Workers() {
   const [delTarget, setDelTarget] = useState<string | null>(null)
   const [newWorker, setNewWorker] = useState({ name: '', device_id: '', position: '' })
   const [saving,    setSaving]    = useState(false)
+  const [detailWorker, setDetailWorker] = useState<WorkerStat | null>(null)
 
   useEffect(() => { fetchAll() }, [])
 
@@ -257,7 +259,10 @@ export default function Workers() {
             initial={{ opacity: 0, scale: 0.95 }}
             animate={{ opacity: 1, scale: 1 }}
           >
-            <Card className="border-blue-100/60 shadow-sm hover:shadow-md transition-all bg-white/80 backdrop-blur-sm group">
+            <Card
+              className="border-blue-100/60 shadow-sm hover:shadow-md transition-all bg-white/80 backdrop-blur-sm group cursor-pointer"
+              onClick={() => setDetailWorker(worker)}
+            >
               <CardContent className="p-4">
                 <div className="flex items-start justify-between">
                   <div className="flex items-center gap-3">
@@ -300,13 +305,17 @@ export default function Workers() {
                     <p className="text-sm font-bold text-slate-700">{worker.avgCei}</p>
                   </div>
                   <div className="flex gap-1">
-                    <Button variant="ghost" size="icon" className="w-7 h-7 text-slate-400 hover:text-blue-500">
+                    <Button
+                      variant="ghost" size="icon"
+                      className="w-7 h-7 text-slate-400 hover:text-blue-500"
+                      onClick={(e) => { e.stopPropagation() }}
+                    >
                       <Pencil className="w-3.5 h-3.5" />
                     </Button>
                     <Button
                       variant="ghost" size="icon"
                       className="w-7 h-7 text-slate-400 hover:text-red-500"
-                      onClick={() => { setDelTarget(worker.id); setIsDelOpen(true) }}
+                      onClick={(e) => { e.stopPropagation(); setDelTarget(worker.id); setIsDelOpen(true) }}
                     >
                       <Trash2 className="w-3.5 h-3.5" />
                     </Button>
@@ -325,6 +334,116 @@ export default function Workers() {
           <p className="text-xs text-slate-400 mt-1">Try adjusting your search or filters</p>
         </div>
       )}
+
+      {/* Worker detail dialog */}
+      <Dialog open={!!detailWorker} onOpenChange={(open) => !open && setDetailWorker(null)}>
+        <DialogContent className="sm:max-w-lg">
+          {detailWorker && (() => {
+            const wRecs = records
+              .filter(r => r.worker_id === detailWorker.id)
+              .slice(0, 10)
+            return (
+              <>
+                <DialogHeader>
+                  <DialogTitle className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-100 to-blue-200 flex items-center justify-center text-sm font-bold text-blue-600">
+                      {detailWorker.name.split(' ').map(n => n[0]).join('').slice(0, 2).toUpperCase()}
+                    </div>
+                    <div>
+                      <p className="text-base font-semibold text-slate-800">{detailWorker.name}</p>
+                      <p className="text-[11px] text-slate-400 font-mono font-normal">
+                        {detailWorker.device_id || detailWorker.id.slice(0, 8)}
+                      </p>
+                    </div>
+                  </DialogTitle>
+                </DialogHeader>
+
+                <div className="space-y-4 pt-2">
+                  {/* Info dasar */}
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="flex items-center gap-2 text-sm text-slate-600">
+                      <Building2 className="w-4 h-4 text-slate-400" />
+                      {detailWorker.position || 'Field Worker'}
+                    </div>
+                    <div className="flex items-center justify-end">
+                      {getStatusBadge(detailWorker.status)}
+                    </div>
+                  </div>
+
+                  {/* Stats grid */}
+                  <div className="grid grid-cols-3 gap-3">
+                    <div className="rounded-xl bg-blue-50/60 p-3 text-center">
+                      <Activity className="w-4 h-4 text-blue-500 mx-auto mb-1" />
+                      <p className="text-lg font-bold text-slate-800">{detailWorker.avgReba}</p>
+                      <p className="text-[10px] text-slate-500">Avg REBA</p>
+                    </div>
+                    <div className="rounded-xl bg-violet-50/60 p-3 text-center">
+                      <TrendingUp className="w-4 h-4 text-violet-500 mx-auto mb-1" />
+                      <p className="text-lg font-bold text-slate-800">{detailWorker.avgCei}</p>
+                      <p className="text-[10px] text-slate-500">Avg CEI</p>
+                    </div>
+                    <div className="rounded-xl bg-emerald-50/60 p-3 text-center">
+                      <Calendar className="w-4 h-4 text-emerald-500 mx-auto mb-1" />
+                      <p className="text-lg font-bold text-slate-800">{detailWorker.recordCount}</p>
+                      <p className="text-[10px] text-slate-500">Total Records</p>
+                    </div>
+                  </div>
+
+                  {/* Last REBA highlight */}
+                  <div className="flex items-center justify-between rounded-xl border border-slate-100 p-3">
+                    <div className="flex items-center gap-2 text-sm text-slate-600">
+                      <ShieldCheck className="w-4 h-4 text-slate-400" />
+                      Last REBA Score
+                    </div>
+                    <p className={`text-lg font-bold ${
+                      detailWorker.lastReba >= 10 ? 'text-red-500' :
+                      detailWorker.lastReba >= 7  ? 'text-orange-500' :
+                      detailWorker.lastReba >= 4  ? 'text-amber-500' :
+                      'text-emerald-500'
+                    }`}>
+                      {detailWorker.lastReba}
+                    </p>
+                  </div>
+
+                  {/* Recent records */}
+                  <div>
+                    <p className="text-xs font-semibold text-slate-600 mb-2 flex items-center gap-1.5">
+                      <Clock className="w-3.5 h-3.5 text-slate-400" />
+                      Recent Records
+                    </p>
+                    {wRecs.length === 0 ? (
+                      <p className="text-xs text-slate-400 text-center py-4">Belum ada data CEI untuk worker ini.</p>
+                    ) : (
+                      <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
+                        {wRecs.map(rec => (
+                          <div
+                            key={rec.id}
+                            className="flex items-center justify-between rounded-lg bg-slate-50 px-3 py-2 text-xs"
+                          >
+                            <span className="text-slate-500">{rec.shift_date}</span>
+                            <div className="flex items-center gap-3">
+                              <span className="text-slate-600">
+                                REBA <span className="font-semibold text-slate-800">{rec.reba_score}</span>
+                              </span>
+                              <span className="text-slate-600">
+                                CEI <span className="font-semibold text-slate-800">{rec.cei_value}</span>
+                              </span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <Button variant="outline" className="w-full" onClick={() => setDetailWorker(null)}>
+                    <X className="w-4 h-4 mr-1.5" /> Tutup
+                  </Button>
+                </div>
+              </>
+            )
+          })()}
+        </DialogContent>
+      </Dialog>
 
       {/* Delete confirmation dialog */}
       <Dialog open={isDelOpen} onOpenChange={setIsDelOpen}>
